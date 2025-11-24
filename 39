@@ -1,0 +1,149 @@
+import time
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor, IsolationForest
+import matplotlib.pyplot as plt
+from IPython.display import display, clear_output
+import os
+import argparse
+
+# ----------------------------
+# Synthetic data generators
+# ----------------------------
+def generate_normal_samples(n, seed=None):
+    if seed is not None:
+        rng = np.random.RandomState(seed)
+    else:
+        rng = np.random
+    ph = rng.normal(loc=7.2, scale=0.3, size=n).clip(5.5, 9.0)
+    turb = rng.exponential(scale=2.0, size=n).clip(0, 100)
+    temp = rng.normal(loc=20, scale=4, size=n).clip(0, 35)
+    do = rng.normal(loc=8.0, scale=1.0, size=n).clip(0, 14)
+    cond = rng.normal(loc=350, scale=200, size=n).clip(20, 2000)
+    df = pd.DataFrame({
+        "pH": ph,
+        "turbidity": turb,
+        "temperature": temp,
+        "dissolved_oxygen": do,
+        "conductivity": cond
+    })
+    return df
+
+def compute_synthetic_wqi(df):
+    # Simple synthetic WQI scoring: normalize features to 0..1 around "good" values, then weighted sum -> 0..100
+    def clamp01(x): return np.minimum(1, np.maximum(0, x))
+    pH_score = 1 - np.abs(df["pH"] - 7.2) / 2.0
+    turb_score = 1 - (df["turbidity"] / 50.0)
+    do_score = (df["dissolved_oxygen"] - 2.0) / 12.0
+    cond_score = 1 - (df["conductivity"] - 50) / 1950.0
+    temp_score = 1 - np.abs(df["temperature"] - 20) / 15.0
+
+    for s in [pH_score, turb_score, do_score, cond_score, temp_score]:
+        s[:] = clamp01(s)
+
+    wqi = (0.20 * pH_score + 0.20 * turb_score + 0.25 * do_score + 0.15 * cond_score + 0.20 * temp_score) * 100
+    return wqi.clip(0, 100)
+
+# ----------------------------
+# Training (on synthetic data)
+# ----------------------------
+def train_models(random_state=0):
+    np.random.seed(random_state)
+    train_df = generate_normal_samples(3000)
+    train_df["WQI"] = compute_synthetic_wqi(train_df)
+
+    # Inject a small set of labelled 'unusual' points into training set so regressor sees some variety
+    anom_df = generate_normal_samples(150)
+    anom_df["pH"] = anom_df["pH"] + np.random.choice([-2.0, 2.0], size=150)
+    anom_df["turbidity"] = anom_df["turbidity"] + np.random.uniform(30, 200, size=150)
+    anom_df["WQI"] = compute_synthetic_wqi(anom_df)
+
+    full_train = pd.concat([train_df, anom_df.sample(40)], ignore_index=True).reset_index(drop=True)
+
+    features = ["pH", "turbidity", "temperature", "dissolved_oxygen", "conductivity"]
+    X = full_train[features].values
+    y = full_train["WQI"].values
+
+    reg = RandomForestRegressor(n_estimators=80, random_state=random_state)
+    reg.fit(X, y)
+
+    iso = IsolationForest(contamination=0.01, random_state=random_state)
+    iso.fit(train_df[features].values)
+
+    return reg, iso, features
+
+# ----------------------------
+# Real-time simulation & logging
+# ----------------------------
+def simulate_stream_and_apply_models(reg, iso, features, iterations=120, window=30, out_csv="/mnt/data/water_stream_log.csv"):
+    if os.path.exists(out_csv):
+        os.remove(out_csv)
+    stream_columns = features + ["predicted_WQI", "anomaly_score", "anomaly_flag", "timestamp"]
+    pd.DataFrame(columns=stream_columns).to_csv(out_csv, index=False)
+
+    def generate_stream_point(i):
+        base = generate_normal_samples(1).iloc[0].to_dict()
+        base["temperature"] += 0.005 * i  # slow drift
+        if (i % 37) == 0:
+            base["turbidity"] += np.random.uniform(80, 300)
+        if (i % 53) == 0:
+            base["pH"] += np.random.choice([-2.5, 2.0])
+        if (i % 101) == 0:
+            base["dissolved_oxygen"] -= np.random.uniform(4, 7)
+        return base
+
+    history = []
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(10, 4))
+    for i in range(iterations):
+        point = generate_stream_point(i)
+        X_new = np.array([[point[f] for f in features]])
+        pred_wqi = reg.predict(X_new)[0]
+        anomaly_score = iso.decision_function(X_new)[0]
+        anomaly_flag = int(iso.predict(X_new)[0] == -1)
+        timestamp = pd.Timestamp.now()
+        row = {**point, "predicted_WQI": float(pred_wqi), "anomaly_score": float(anomaly_score),
+               "anomaly_flag": int(anomaly_flag), "timestamp": timestamp}
+        history.append(row)
+        pd.DataFrame([row])[stream_columns].to_csv(out_csv, mode="a", header=False, index=False)
+
+        last_df = pd.DataFrame(history[-window:]).reset_index(drop=True)
+        clear_output(wait=True)
+        display(last_df.tail(10))
+
+        # plot
+        ax.clear()
+        ax.set_title(f"Real-time water quality (iteration {i+1}/{iterations})")
+        ax.set_xlabel("sample (older -> newer)")
+        ax.set_ylabel("predicted WQI")
+        ax.set_ylim(-5, 105)
+        ax.plot(last_df["predicted_WQI"].values, marker='o')
+        anomalies = last_df[last_df["anomaly_flag"] == 1]
+        if not anomalies.empty:
+            ax.scatter(anomalies.index.values, anomalies["predicted_WQI"].values)
+            for idx, r in anomalies.iterrows():
+                ax.annotate("ANOM", (idx, r["predicted_WQI"]), textcoords="offset points", xytext=(0,8), ha='center')
+        plt.pause(0.08)
+        time.sleep(0.05)
+
+    clear_output(wait=True)
+    final_log = pd.read_csv(out_csv)
+    display(final_log.tail(40))
+    print(f"Stream log saved to: {out_csv}")
+
+# ----------------------------
+# Entrypoint
+# ----------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Real-time Water Quality demo with synthetic data")
+    parser.add_argument("--iterations", type=int, default=120, help="Number of stream iterations")
+    parser.add_argument("--out", type=str, default="/mnt/data/water_stream_log.csv", help="Output CSV file")
+    args = parser.parse_args()
+
+    print("Training models on synthetic data...")
+    reg, iso, features = train_models()
+    print("Starting simulated real-time stream (press Ctrl-C to stop)...")
+    simulate_stream_and_apply_models(reg, iso, features, iterations=args.iterations, out_csv=args.out)
+
+if __name__ == "__main__":
+    main()
